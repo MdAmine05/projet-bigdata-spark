@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install pyspark==3.5.0 psycopg2-binary kafka-python
+RUN pip install pyspark==3.5.0 psycopg2-binary kafka-python requests
 
 COPY streaming.py /app/streaming.py
 COPY entrypoint.sh /app/entrypoint.sh

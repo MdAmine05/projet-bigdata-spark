@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 streaming.py — Spark Structured Streaming
-Lit 3 topics Kafka (web-logs, auth-logs, fw-logs) en parallèle
-Détecte 6 types d'anomalies et écrit dans PostgreSQL
+Lit 3 topics Kafka + détecte 6 anomalies + alertes Telegram
 """
 
 from pyspark.sql import SparkSession
@@ -12,18 +11,18 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.types import (
     StructType, StructField,
-    StringType, IntegerType, TimestampType
+    StringType, IntegerType
 )
 import psycopg2
+import requests
 from datetime import datetime
-import json
 
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
 
 KAFKA_SERVER = "kafka:19092"
-TOPICS = "web-logs,auth-logs,fw-logs"   # Spark lit les 3 en même temps
+TOPICS = "web-logs,auth-logs,fw-logs"
 
 DB_CONFIG = {
     "host": "postgres",
@@ -33,34 +32,67 @@ DB_CONFIG = {
     "password": "secret"
 }
 
-# IPs blacklistées — même liste que dans firewall/log_producer.py
+# Telegram
+TELEGRAM_TOKEN = "8754347944:AAF-3CVHORuFZjJb7jTu2dNk9i2iFBVbDbg"
+TELEGRAM_CHAT_ID = "8583393564"
+
 BLACKLISTED_IPS = [
     "10.0.0.99", "192.168.1.200", "172.16.0.50",
     "10.10.10.10", "192.168.100.1"
 ]
 
 # ─────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────
+
+def send_telegram_alert(alert_type, ip, severity, details):
+    """Envoie une alerte Telegram pour HIGH et CRITICAL"""
+    emoji = {
+        "CRITICAL": "🔴",
+        "HIGH":     "🟠",
+        "MEDIUM":   "🟡",
+        "LOW":      "🟢"
+    }.get(severity, "⚪")
+
+    message = (
+        f"{emoji} *ALERTE SÉCURITÉ — {severity}*\n\n"
+        f"🎯 Type: `{alert_type}`\n"
+        f"🖥️ IP: `{ip}`\n"
+        f"📋 Détails: {details}\n"
+        f"⏰ Heure: {datetime.utcnow().strftime('%H:%M:%S')} UTC\n\n"
+        f"_Pipeline BigData — Kafka + Spark_"
+    )
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        resp = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }, timeout=5)
+        if resp.status_code == 200:
+            print(f"  📱 Telegram envoyé → {severity} {alert_type}")
+        else:
+            print(f"  ⚠️ Telegram erreur: {resp.text}")
+    except Exception as e:
+        print(f"  ❌ Telegram exception: {e}")
+
+# ─────────────────────────────────────────
 # SCHÉMA JSON UNIFIÉ
-# Les 3 sources envoient des champs communs :
-# source, timestamp, ip, event_type, severity, details
-# + champs spécifiques selon la source
 # ─────────────────────────────────────────
 
 EVENT_SCHEMA = StructType([
-    StructField("source",     StringType(),  True),  # web-server / auth-server / firewall
-    StructField("timestamp",  StringType(),  True),  # ISO 8601
-    StructField("ip",         StringType(),  True),  # IP source
-    StructField("event_type", StringType(),  True),  # FAILED_PASSWORD, FORBIDDEN_ACCESS...
-    StructField("severity",   StringType(),  True),  # LOW / MEDIUM / HIGH / CRITICAL
-    StructField("details",    StringType(),  True),  # description lisible
-    # Champs web-server
+    StructField("source",     StringType(),  True),
+    StructField("timestamp",  StringType(),  True),
+    StructField("ip",         StringType(),  True),
+    StructField("event_type", StringType(),  True),
+    StructField("severity",   StringType(),  True),
+    StructField("details",    StringType(),  True),
     StructField("method",     StringType(),  True),
     StructField("path",       StringType(),  True),
     StructField("status",     IntegerType(), True),
-    # Champs auth-server
     StructField("user",       StringType(),  True),
     StructField("port",       IntegerType(), True),
-    # Champs firewall
     StructField("dst_port",   IntegerType(), True),
     StructField("protocol",   StringType(),  True),
     StructField("action",     StringType(),  True),
@@ -82,7 +114,7 @@ spark.sparkContext.setLogLevel("WARN")
 print("✅ SparkSession démarrée")
 
 # ─────────────────────────────────────────
-# LECTURE KAFKA — 3 TOPICS EN MÊME TEMPS
+# LECTURE KAFKA
 # ─────────────────────────────────────────
 
 raw_stream = spark.readStream \
@@ -92,40 +124,24 @@ raw_stream = spark.readStream \
     .option("startingOffsets", "latest") \
     .load()
 
-# Décoder la valeur JSON de chaque message Kafka
 events = raw_stream.select(
-    from_json(
-        col("value").cast("string"),
-        EVENT_SCHEMA
-    ).alias("e"),
-    col("topic")   # on garde le topic pour savoir d'où vient l'event
+    from_json(col("value").cast("string"), EVENT_SCHEMA).alias("e"),
+    col("topic")
 ).select("e.*", "topic")
 
-# Convertir le timestamp string ISO → TimestampType Spark
-events = events.withColumn(
-    "event_time",
-    to_timestamp(col("timestamp"))
-)
-
-print(f"📡 Lecture des topics : {TOPICS}")
+events = events.withColumn("event_time", to_timestamp(col("timestamp")))
 
 # ─────────────────────────────────────────
 # RÈGLES DE DÉTECTION
 # ─────────────────────────────────────────
 
-# ── Règle 1 : BRUTE FORCE SSH ───────────────────────────────
-# > 5 Failed password depuis la même IP en 1 minute
-# Source : auth-logs uniquement
-
+# Règle 1 — Brute Force SSH
 brute_force = events \
     .filter(
         (col("topic") == "auth-logs") &
         (col("event_type") == "FAILED_PASSWORD")
     ) \
-    .groupBy(
-        window(col("event_time"), "1 minute"),
-        col("ip")
-    ) \
+    .groupBy(window(col("event_time"), "1 minute"), col("ip")) \
     .agg(count("*").alias("nb_fails")) \
     .filter(col("nb_fails") > 5) \
     .select(
@@ -136,28 +152,19 @@ brute_force = events \
             .alias("details")
     )
 
-# ── Règle 2 : IP BLACKLISTÉE ────────────────────────────────
-# Toute connexion depuis une IP de la blacklist
-# Source : tous les topics
-
-blacklist_filter = " OR ".join([
-    f"ip = '{ip}'" for ip in BLACKLISTED_IPS
-])
-
+# Règle 2 — IP Blacklistée (tous topics)
+blacklist_filter = " OR ".join([f"ip = '{ip}'" for ip in BLACKLISTED_IPS])
 suspicious_ip = events \
     .filter(blacklist_filter) \
     .select(
         col("ip"),
         lit("SUSPICIOUS_IP").alias("alert_type"),
         lit("CRITICAL").alias("severity"),
-        expr("concat('IP blacklistée détectée: ', ip, ' via ', source, ' (', event_type, ')')")
+        expr("concat('IP blacklistée: ', ip, ' via ', source, ' (', event_type, ')')")
             .alias("details")
     )
 
-# ── Règle 3 : PORT SUSPECT (web) ────────────────────────────
-# Accès à des paths sensibles sur le web-server (403/404)
-# Source : web-logs
-
+# Règle 3 — Accès Web Suspect
 suspicious_web = events \
     .filter(
         (col("topic") == "web-logs") &
@@ -171,10 +178,7 @@ suspicious_web = events \
             .alias("details")
     )
 
-# ── Règle 4 : PORT SCAN ─────────────────────────────────────
-# Détecté par le firewall
-# Source : fw-logs
-
+# Règle 4 — Port Scan
 port_scan = events \
     .filter(
         (col("topic") == "fw-logs") &
@@ -188,10 +192,7 @@ port_scan = events \
             .alias("details")
     )
 
-# ── Règle 5 : CONNEXION HEURE INHABITUELLE ──────────────────
-# Toute connexion entre 00h et 05h UTC
-# Source : tous les topics
-
+# Règle 5 — Heure Inhabituelle
 unusual_time = events \
     .filter(
         (expr("hour(event_time)").between(0, 5)) &
@@ -205,10 +206,7 @@ unusual_time = events \
             .alias("details")
     )
 
-# ── Règle 6 : IP BLACKLISTÉE AU NIVEAU FIREWALL ─────────────
-# Port scan + IP blacklist combinés
-# Source : fw-logs
-
+# Règle 6 — Firewall Blacklist
 fw_blacklist = events \
     .filter(
         (col("topic") == "fw-logs") &
@@ -222,10 +220,7 @@ fw_blacklist = events \
             .alias("details")
     )
 
-# ─────────────────────────────────────────
-# UNION DE TOUTES LES ALERTES
-# ─────────────────────────────────────────
-
+# Union de toutes les alertes
 all_alerts = brute_force \
     .union(suspicious_ip) \
     .union(suspicious_web) \
@@ -234,14 +229,10 @@ all_alerts = brute_force \
     .union(fw_blacklist)
 
 # ─────────────────────────────────────────
-# ÉCRITURE DANS POSTGRESQL
+# ÉCRITURE POSTGRESQL + TELEGRAM
 # ─────────────────────────────────────────
 
-def write_to_postgres(df, epoch_id):
-    """
-    foreachBatch — appelé à chaque micro-batch Spark
-    Insère les alertes dans PostgreSQL
-    """
+def write_to_postgres_and_alert(df, epoch_id):
     if df.count() == 0:
         return
 
@@ -253,6 +244,7 @@ def write_to_postgres(df, epoch_id):
         cur = conn.cursor()
 
         for row in rows:
+            # 1. Écrire dans PostgreSQL
             cur.execute("""
                 INSERT INTO alerts (timestamp, ip, alert_type, details, severity)
                 VALUES (%s, %s, %s, %s, %s)
@@ -265,6 +257,15 @@ def write_to_postgres(df, epoch_id):
             ))
             print(f"  ✅ [{row['severity']}] {row['alert_type']} — {row['ip']}")
 
+            # 2. Telegram pour HIGH et CRITICAL uniquement
+            if row["severity"] in ["HIGH", "CRITICAL"]:
+                send_telegram_alert(
+                    row["alert_type"],
+                    row["ip"],
+                    row["severity"],
+                    row["details"]
+                )
+
         conn.commit()
         cur.close()
         conn.close()
@@ -273,18 +274,17 @@ def write_to_postgres(df, epoch_id):
         print(f"❌ Erreur PostgreSQL: {e}")
 
 # ─────────────────────────────────────────
-# LANCEMENT DU STREAMING
+# LANCEMENT
 # ─────────────────────────────────────────
 
 query = all_alerts.writeStream \
     .outputMode("update") \
-    .foreachBatch(write_to_postgres) \
+    .foreachBatch(write_to_postgres_and_alert) \
     .trigger(processingTime="10 seconds") \
     .start()
 
 print("🚀 Spark Streaming lancé — en attente d'événements...")
-print(f"   Topics écoutés : {TOPICS}")
-print(f"   Règles actives : BRUTE_FORCE, SUSPICIOUS_IP, SUSPICIOUS_WEB_ACCESS,")
-print(f"                    PORT_SCAN, UNUSUAL_TIME, FW_BLACKLISTED_IP")
+print(f"   Topics : {TOPICS}")
+print(f"   Telegram : activé pour HIGH + CRITICAL")
 
 query.awaitTermination()
