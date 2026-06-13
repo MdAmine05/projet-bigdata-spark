@@ -1,5 +1,9 @@
 services:
 
+  # ─────────────────────────────────────────
+  # INFRASTRUCTURE
+  # ─────────────────────────────────────────
+
   kafka:
     image: apache/kafka:latest
     container_name: kafka
@@ -15,6 +19,13 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
       KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks:
+      - bigdata-net
 
   postgres:
     image: postgres:16
@@ -27,6 +38,8 @@ services:
       POSTGRES_DB: securitydb
     volumes:
       - ./storage/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - bigdata-net
 
   grafana:
     image: grafana/grafana:latest
@@ -37,12 +50,89 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
     depends_on:
       - postgres
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - bigdata-net
+
+  # ─────────────────────────────────────────
+  # TRAITEMENT SPARK
+  # ─────────────────────────────────────────
 
   spark:
     build: ./spark
     container_name: spark
     depends_on:
-      - kafka
-      - postgres
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_started
     volumes:
       - ./spark/streaming.py:/app/streaming.py
+    networks:
+      - bigdata-net
+
+  # ─────────────────────────────────────────
+  # 3 VMs — SOURCES DE LOGS RÉELS
+  # ─────────────────────────────────────────
+
+  web-server:
+    build: ./vms/web-server
+    container_name: web-server
+    ports:
+      - "8080:80"          # accès depuis Ubuntu host : curl http://localhost:8080
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      vm-network:
+        ipv4_address: 172.20.0.10
+      bigdata-net:
+    hostname: web-server
+
+  auth-server:
+    build: ./vms/auth-server
+    container_name: auth-server
+    ports:
+      - "2222:22"          # accès depuis Ubuntu host : ssh -p 2222 root@localhost
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      vm-network:
+        ipv4_address: 172.20.0.11
+      bigdata-net:
+    hostname: auth-server
+
+  firewall:
+    build: ./vms/firewall
+    container_name: firewall
+    cap_add:
+      - NET_ADMIN            # nécessaire pour iptables
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      vm-network:
+        ipv4_address: 172.20.0.12
+      bigdata-net:
+    hostname: firewall
+
+# ─────────────────────────────────────────
+# RÉSEAUX
+# ─────────────────────────────────────────
+
+networks:
+  # Réseau principal (kafka, spark, postgres, grafana)
+  bigdata-net:
+    driver: bridge
+
+  # Réseau isolé des 3 VMs
+  vm-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  grafana-data:
