@@ -205,13 +205,13 @@ This is what makes it **streaming detection** — not just counting total events
 ![Grafana Config](documentation/demo/5-config-postgres-grafana.png)
 
 ### Grafana — Live Alerts Table Panel
-![Grafana Alerts Table](documentation/demo/6-Alertes_en_temps_réel.png)
+![Grafana Alerts Table](documentation/demo/6-Alertes-en-temps-réel.png)
 
 ### Grafana — Alerts per Minute Time Series
-![Grafana Time Series](documentation/demo/7-Alertes_par_minute.png)
+![Grafana Time Series](documentation/demo/7-Alertes-par-minute.png)
 
 ### Grafana — Severity Distribution Bar Chart
-![Grafana Bar Chart](documentation/demo/8-Répartition_par_sévérité.png)
+![Grafana Bar Chart](documentation/demo/8-Répartition-par-sévérité.png)
 
 ### Grafana — Full Security Monitoring Dashboard
 ![Grafana Dashboard](documentation/demo/9-dashboard-grafana.png)
